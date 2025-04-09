@@ -11,20 +11,51 @@ from typing import List, Dict
 import uvicorn
 import sys
 from pathlib import Path
-import importlib
+import torch.nn as nn
+from torch.utils.data import Dataset
 
-# Add the parent directory to the Python path to import the model
-project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
 
-# Import the model using the correct path
-model_path = (
-    project_root / "Deep Learning Model" / "Training" / "chest_xray_model_torch.py"
-)
-spec = importlib.util.spec_from_file_location("chest_xray_model_torch", str(model_path))
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-ChestXRayModel = module.ChestXRayModel
+# Define the model class directly in the file
+class ChestXRayModel(nn.Module):
+    def __init__(self, num_classes):
+        super(ChestXRayModel, self).__init__()
+        # ResNet-like architecture
+        self.features = nn.Sequential(
+            # Initial conv layer
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            # Block 1
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 2
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 3
+            nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Adaptive pooling to ensure fixed size output regardless of input size
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Fully connected layer for classification
+        self.classifier = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
 
 # Initialize FastAPI app
 app = FastAPI(title="Chest X-Ray Classification API")
@@ -44,31 +75,46 @@ MODEL_PATH = "Model/chest_xray_model.pth"
 CLASS_NAMES_PATH = "Model/class_names.npy"
 
 # Define image transformation pipeline
-transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
 
 # Check for GPU availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Load model
-try:
-    # Load class names first to get the number of classes
-    class_names = np.load(CLASS_NAMES_PATH, allow_pickle=True)
-    num_classes = len(class_names)
+# Flag to indicate if model is loaded
+model_loaded = False
+class_names = []
 
-    # Initialize the model with the correct number of classes
-    model = ChestXRayModel(num_classes)
-    # Load the state dictionary
-    state_dict = torch.load(MODEL_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-except FileNotFoundError:
-    raise Exception("Model file not found. Please ensure chest_xray_model.pth exists.")
+try:
+    # Try to load class names and model
+    if Path(CLASS_NAMES_PATH).exists() and Path(MODEL_PATH).exists():
+        class_names = np.load(CLASS_NAMES_PATH, allow_pickle=True)
+        num_classes = len(class_names)
+
+        # Initialize the model with the correct number of classes
+        model = ChestXRayModel(num_classes)
+        # Load the state dictionary
+        state_dict = torch.load(MODEL_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+        model_loaded = True
+        print("Model loaded successfully")
+    else:
+        print(f"Model files not found at {MODEL_PATH} or {CLASS_NAMES_PATH}")
+        # Define dummy class names for testing
+        class_names = ["Pneumonia", "COVID-19", "Tuberculosis", "Normal"]
+
+except Exception as e:
+    print(f"Error loading model: {e}")
+    # Define dummy class names for testing
+    class_names = ["Pneumonia", "COVID-19", "Tuberculosis", "Normal"]
 
 
 @app.get("/")
@@ -78,11 +124,22 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    status = "healthy" if model_loaded else "model_not_loaded"
+    return {"status": status}
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    if not model_loaded:
+        # Return simulated predictions for testing/development
+        return {
+            "predictions": [
+                {"class": "Normal", "probability": 0.85},
+                {"class": "Pneumonia", "probability": 0.15},
+            ],
+            "message": "Test prediction (model not loaded)",
+        }
+
     try:
         # Read and validate image
         contents = await file.read()
@@ -123,8 +180,12 @@ async def predict(file: UploadFile = File(...)):
 
 @app.get("/classes")
 async def get_classes():
-    return {"classes": class_names.tolist()}
+    return {
+        "classes": (
+            class_names if isinstance(class_names, list) else class_names.tolist()
+        )
+    }
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", reload=True)
+    uvicorn.run()
