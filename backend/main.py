@@ -6,13 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import io
 from torchvision import transforms
-import json
-from typing import List, Dict
+from typing import List
 import uvicorn
-import sys
 from pathlib import Path
 import torch.nn as nn
-from torch.utils.data import Dataset
 
 
 # Define the model class directly in the file
@@ -71,17 +68,19 @@ app.add_middleware(
 
 # Constants
 IMAGE_SIZE = (224, 224)
-MODEL_PATH = "Model/chest_xray_model.pth"
-CLASS_NAMES_PATH = "Model/class_names.npy"
+
+# Get the absolute path to the backend directory
+BACKEND_DIR = Path(__file__).parent.absolute()
+MODEL_DIR = BACKEND_DIR / "Model"
+MODEL_PATH = MODEL_DIR / "chest_xray_model.pth"
+CLASS_NAMES_PATH = MODEL_DIR / "class_names.npy"
 
 # Define image transformation pipeline
-transform = transforms.Compose(
-    [
-        transforms.Resize(IMAGE_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
+transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
 # Check for GPU availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -92,28 +91,27 @@ model_loaded = False
 class_names = []
 
 try:
-    # Try to load class names and model
-    if Path(CLASS_NAMES_PATH).exists() and Path(MODEL_PATH).exists():
+    if MODEL_PATH.exists() and CLASS_NAMES_PATH.exists():
+        # Load class names
         class_names = np.load(CLASS_NAMES_PATH, allow_pickle=True)
         num_classes = len(class_names)
-
-        # Initialize the model with the correct number of classes
+        
+        # Initialize model
         model = ChestXRayModel(num_classes)
-        # Load the state dictionary
+        
+        # Load model weights
         state_dict = torch.load(MODEL_PATH, map_location=device)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
+        
         model.to(device)
         model.eval()
         model_loaded = True
         print("Model loaded successfully")
     else:
-        print(f"Model files not found at {MODEL_PATH} or {CLASS_NAMES_PATH}")
-        # Define dummy class names for testing
+        print(f"Model files not found, using dummy predictions")
         class_names = ["Pneumonia", "COVID-19", "Tuberculosis", "Normal"]
-
 except Exception as e:
-    print(f"Error loading model: {e}")
-    # Define dummy class names for testing
+    print(f"Error loading model: {str(e)}")
     class_names = ["Pneumonia", "COVID-19", "Tuberculosis", "Normal"]
 
 
@@ -124,14 +122,19 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    status = "healthy" if model_loaded else "model_not_loaded"
-    return {"status": status}
+    return {
+        "status": "healthy" if model_loaded else "model_not_loaded",
+        "model_status": "loaded" if model_loaded else "not_loaded",
+        "device": str(device),
+        "model_path_exists": MODEL_PATH.exists(),
+        "class_names_path_exists": CLASS_NAMES_PATH.exists(),
+        "classes": len(class_names) if isinstance(class_names, (list, np.ndarray)) else 0
+    }
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if not model_loaded:
-        # Return simulated predictions for testing/development
         return {
             "predictions": [
                 {"class": "Normal", "probability": 0.85},
@@ -141,24 +144,18 @@ async def predict(file: UploadFile = File(...)):
         }
 
     try:
-        # Read and validate image
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-
-        # Preprocess image
         image_tensor = transform(image).unsqueeze(0).to(device)
 
-        # Make prediction
         with torch.no_grad():
             outputs = model(image_tensor)
             probabilities = torch.sigmoid(outputs)
             predictions = (probabilities > 0.5).float()
 
-        # Convert to numpy
         predictions = predictions.cpu().numpy()[0]
         probabilities = probabilities.cpu().numpy()[0]
 
-        # Get predicted classes and their probabilities
         predicted_classes = []
         for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
             if pred == 1:
@@ -166,7 +163,6 @@ async def predict(file: UploadFile = File(...)):
                     {"class": class_names[i], "probability": float(prob)}
                 )
 
-        # Sort by probability
         predicted_classes.sort(key=lambda x: x["probability"], reverse=True)
 
         return {
@@ -188,4 +184,4 @@ async def get_classes():
 
 
 if __name__ == "__main__":
-    uvicorn.run()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

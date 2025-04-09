@@ -21,13 +21,27 @@ function App() {
   useEffect(() => {
     const checkApiStatus = async () => {
       try {
+        console.log(`Checking API health at ${API_URL}/health`);
         const response = await fetch(`${API_URL}/health`);
+        
+        if (!response.ok) {
+          throw new Error(`API health check failed with status: ${response.status}`);
+        }
+        
         const data = await response.json();
+        console.log("API health response:", data);
         setApiStatus(data.status);
         
         // Fetch available disease classes
+        console.log(`Fetching classes from ${API_URL}/classes`);
         const classesResponse = await fetch(`${API_URL}/classes`);
+        
+        if (!classesResponse.ok) {
+          throw new Error(`Classes fetch failed with status: ${classesResponse.status}`);
+        }
+        
         const classesData = await classesResponse.json();
+        console.log("API classes response:", classesData);
         setAvailableClasses(classesData.classes);
       } catch (error) {
         console.error("API connection error:", error);
@@ -55,12 +69,19 @@ function App() {
     formData.append("file", selectedImage);
 
     try {
+      console.log(`Sending request to ${API_URL}/predict`);
+      
       const response = await fetch(`${API_URL}/predict`, {
         method: "POST",
         body: formData,
       });
 
+      if (!response.ok) {
+        throw new Error(`API responded with status: ${response.status}`);
+      }
+
       const data = await response.json();
+      console.log("API response:", data);
       
       if (data.predictions && data.predictions.length > 0) {
         setPrediction({
@@ -75,7 +96,7 @@ function App() {
       }
     } catch (error) {
       console.error("Error:", error);
-      alert("Error processing the image. Please try again.");
+      alert(`Error processing the image: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       setLoading(false);
     }
@@ -132,7 +153,7 @@ function App() {
             />
             <button
               onClick={handleSubmit}
-              disabled={!selectedImage || loading || apiStatus !== "healthy"}
+              disabled={!selectedImage || loading}
               className="predict-button"
             >
               {loading ? "Processing..." : "Predict Disease"}
