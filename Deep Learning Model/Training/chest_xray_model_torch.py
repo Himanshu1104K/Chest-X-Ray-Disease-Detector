@@ -127,15 +127,9 @@ def create_data_loaders(image_paths, labels, test_size=0.2, val_size=0.1):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
         }
-        train_transform = transforms.Compose([
-
-            transforms.Resize(IMAGE_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
         
         # Create datasets
-        train_dataset = ChestXRayDataset(X_train, y_train, transform=train_transform)
+        train_dataset = ChestXRayDataset(X_train, y_train, transform=data_transforms['train'])
         val_dataset = ChestXRayDataset(X_val, y_val, transform=data_transforms['val'])
         test_dataset = ChestXRayDataset(X_test, y_test, transform=data_transforms['val'])
         
@@ -240,7 +234,8 @@ def train_model():
                 train_correct += (predicted == labels).all(dim=1).sum().item()
                 train_total += labels.size(0)
                 
-                progress_bar.set_postfix({'loss': train_loss/(progress_bar.n+1)})
+                # Update progress bar with current batch loss
+                progress_bar.set_postfix({'loss': loss.item()})
             
             train_accuracy = train_correct / train_total
             
@@ -291,7 +286,7 @@ def train_model():
             print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
         
         # Load best model
-        model.load_state_dict(torch.load('best_model.pth'))
+        model.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'best_model.pth')))
         
         # Test phase
         model.eval()
