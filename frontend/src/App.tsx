@@ -16,6 +16,7 @@ function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [apiStatus, setApiStatus] = useState<string>("");
   const [availableClasses, setAvailableClasses] = useState<string[]>([]);
+  const [error, setError] = useState<string>("");
 
   // Check API health on component mount
   useEffect(() => {
@@ -52,12 +53,98 @@ function App() {
     checkApiStatus();
   }, []);
 
-  const handleImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const validateXRayImage = (file: File): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        // Basic validation criteria for X-ray images:
+        // 1. Grayscale or limited color palette
+        // 2. Relatively high aspect ratio (chest X-rays are typically portrait or square)
+        // 3. Reasonable dimensions for medical images
+        
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        
+        if (!ctx) {
+          resolve(false);
+          return;
+        }
+        
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        
+        // Sample pixels to check if it's likely grayscale
+        let colorVariation = 0;
+        let sampleSize = 100;
+        let sampledPixels = 0;
+        
+        for (let i = 0; i < data.length; i += 4 * Math.floor(data.length / (4 * sampleSize))) {
+          if (sampledPixels >= sampleSize) break;
+          
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          
+          // In grayscale images, R, G, and B values are very similar
+          const variation = Math.max(Math.abs(r - g), Math.abs(r - b), Math.abs(g - b));
+          colorVariation += variation;
+          sampledPixels++;
+        }
+        
+        const avgColorVariation = colorVariation / sampledPixels;
+        const aspectRatio = img.width / img.height;
+        const minDimension = Math.min(img.width, img.height);
+        
+        // Typical X-ray images:
+        // - Have low color variation (mostly grayscale)
+        // - Have aspect ratios close to 1:1 or portrait
+        // - Have sufficiently high resolution
+        const isLikelyXRay = 
+          avgColorVariation < 20 && // Low color variation
+          aspectRatio >= 0.5 && aspectRatio <= 1.5 && // Reasonable aspect ratio
+          minDimension >= 300; // Reasonable image size
+        
+        resolve(isLikelyXRay);
+      };
+      
+      img.onerror = () => {
+        resolve(false);
+      };
+      
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
+  const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
-      setSelectedImage(file);
-      setPreviewUrl(URL.createObjectURL(file));
+      // Clear previous state
+      setError("");
       setPrediction(null);
+      
+      // Validate file type
+      if (!file.type.startsWith('image/')) {
+        setError("Please upload an image file.");
+        return;
+      }
+      
+      // Create preview
+      const tempPreviewUrl = URL.createObjectURL(file);
+      setPreviewUrl(tempPreviewUrl);
+      
+      // Validate if it's likely an X-ray image
+      const isXRay = await validateXRayImage(file);
+      
+      if (!isXRay) {
+        setError("The uploaded image doesn't appear to be a chest X-ray. Please upload a valid chest X-ray image.");
+        return;
+      }
+      
+      // If validation passes, set the selected image
+      setSelectedImage(file);
     }
   };
 
@@ -159,6 +246,12 @@ function App() {
               {loading ? "Processing..." : "Predict Disease"}
             </button>
           </div>
+          
+          {error && (
+            <div className="error-message">
+              {error}
+            </div>
+          )}
         </div>
 
         {prediction && (
