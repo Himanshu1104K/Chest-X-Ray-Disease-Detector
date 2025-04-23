@@ -5,10 +5,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
-from torchvision.transforms import functional as F
+from torchvision import models, transforms, datasets
+from torchvision.transforms import functional as TF
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import classification_report
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -17,10 +19,12 @@ from tqdm import tqdm
 # Constants
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 16
-EPOCHS = 100
+EPOCHS = 25
 LEARNING_RATE = 0.0001
 WEIGHT_DECAY = 1e-4
-
+PATIENCE = 5
+EARLY_STOPPING_DELTA = 0.001
+MODEL_DIR = 'Model'
 # Update paths
 csv_path = '../archive/sample_labels.csv'
 image_dir = '../archive/sample/images'
@@ -31,6 +35,7 @@ print(f"Using device: {device}")
 
 class ChestXRayDataset(Dataset):
     def __init__(self, image_paths, labels, transform=None):
+        super().__init__()
         self.image_paths = image_paths
         self.labels = labels
         self.transform = transform
@@ -49,6 +54,9 @@ class ChestXRayDataset(Dataset):
         return image, torch.FloatTensor(label)
 
 def load_and_preprocess_data(csv_path, image_dir):
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
+
     try:
         # Load the CSV file
         df = pd.read_csv(csv_path)
@@ -104,17 +112,23 @@ def create_data_loaders(image_paths, labels, test_size=0.2, val_size=0.1):
         )
         
         # Define transforms
+        data_transforms = {
+        'train': transforms.Compose([
+        transforms.Resize(IMAGE_SIZE),
+        transforms.RandomCrop((IMAGE_SIZE[0] - 10, IMAGE_SIZE[1] - 10)),  
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        }
         train_transform = transforms.Compose([
-            transforms.Resize(IMAGE_SIZE),
-            transforms.RandomRotation(30),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.ColorJitter(brightness=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        val_test_transform = transforms.Compose([
+
             transforms.Resize(IMAGE_SIZE),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -122,8 +136,8 @@ def create_data_loaders(image_paths, labels, test_size=0.2, val_size=0.1):
         
         # Create datasets
         train_dataset = ChestXRayDataset(X_train, y_train, transform=train_transform)
-        val_dataset = ChestXRayDataset(X_val, y_val, transform=val_test_transform)
-        test_dataset = ChestXRayDataset(X_test, y_test, transform=val_test_transform)
+        val_dataset = ChestXRayDataset(X_val, y_val, transform=data_transforms['val'])
+        test_dataset = ChestXRayDataset(X_test, y_test, transform=data_transforms['val'])
         
         # Create data loaders
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
@@ -140,7 +154,7 @@ class ChestXRayModel(nn.Module):
         super(ChestXRayModel, self).__init__()
         
         # Use EfficientNet-B4 as base model
-        self.base_model = models.efficientnet_b4(pretrained=True)
+        self.base_model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.DEFAULT)
         
         # Modify the classifier
         num_features = self.base_model.classifier[1].in_features
@@ -150,7 +164,7 @@ class ChestXRayModel(nn.Module):
             nn.ReLU(),
             nn.BatchNorm1d(1024),
             nn.Dropout(0.3),
-            nn.Linear(1024, 512),
+            nn.Linear(1024, 512) ,
             nn.ReLU(),
             nn.BatchNorm1d(512),
             nn.Dropout(0.2),
@@ -160,9 +174,9 @@ class ChestXRayModel(nn.Module):
         # Unfreeze last 20 layers
         for param in self.base_model.parameters():
             param.requires_grad = False
-        for param in self.base_model.features[-20:].parameters():
+        for param in self.base_model.features[6:].parameters():
             param.requires_grad = True
-        for param in self.base_model.classifier.parameters():
+        for param in self.base_model.classifier.parameters(): 
             param.requires_grad = True
 
     def forward(self, x):
@@ -196,14 +210,16 @@ def train_model():
         )
         
         # Learning rate scheduler
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.2, patience=3, verbose=True
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.2, patience=PATIENCE//2, verbose=True
         )
         
-        # Training loop
+        # Early stopping
         best_val_loss = float('inf')
+        early_stopping_counter = 0
+        # Training loop
         for epoch in range(EPOCHS):
-            # Training phase
+             # Training phase
             model.train()
             train_loss = 0.0
             train_correct = 0
@@ -248,15 +264,29 @@ def train_model():
             val_accuracy = val_correct / val_total
             val_loss /= len(val_loader)
             
-            # Update learning rate
-            scheduler.step(val_loss)
-            
-            # Save best model
-            if val_loss < best_val_loss:
+             # Update learning rate
+            lr_scheduler.step(val_loss)
+
+            # Early stopping check
+            if val_loss < best_val_loss - EARLY_STOPPING_DELTA:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), 'best_model.pth')
+                early_stopping_counter = 0
+                torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'best_model.pth'))
+                print(f"Saved model to {os.path.join(MODEL_DIR, 'best_model.pth')}")
+            else:
+                early_stopping_counter += 1
+                if early_stopping_counter >= PATIENCE:
+                    print(f"Early stopping triggered after {epoch+1} epochs. No improvement for {PATIENCE} epochs.")
+                    break
+
+
+            # Save best model
             
-            print(f'Epoch {epoch+1}/{EPOCHS}:')
+            
+            
+            
+            
+            print(f'\nEpoch {epoch+1}/{EPOCHS}:')
             print(f'Train Loss: {train_loss/len(train_loader):.4f}, Train Accuracy: {train_accuracy:.4f}')
             print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
         
@@ -268,28 +298,39 @@ def train_model():
         test_correct = 0
         test_total = 0
         
+        y_true = []
+        y_pred = []
+
+        progress_bar = tqdm(test_loader, desc=f'Evaluating')
         with torch.no_grad():
-            for images, labels in test_loader:
+            for images, labels in progress_bar:
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                predicted = (torch.sigmoid(outputs) > 0.5).float()
-                test_correct += (predicted == labels).all(dim=1).sum().item()
-                test_total += labels.size(0)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+                predictions = (probs > 0.5).float()
+                y_true.extend(labels.cpu().numpy())
+                y_pred.extend(predictions.cpu().numpy())
         
-        test_accuracy = test_correct / test_total
-        print(f'Test Accuracy: {test_accuracy:.4f}')
+        y_true = np.array(y_true)
+        y_pred = np.array(y_pred)
         
-        # Save final model
-        torch.save(model.state_dict(), 'chest_xray_model.pth')
+        # Evaluate model
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        roc_auc = roc_auc_score(y_true, y_pred, average='macro')
         
-        # Save class names
-        np.save('class_names.npy', class_names)
+        print(f'\nTest Accuracy: {accuracy:.4f}, Test Precision: {precision:.4f}, Test Recall: {recall:.4f}, Test F1-Score: {f1:.4f}, Test AUC-ROC: {roc_auc:.4f}')
+        
+         # Save final model and class names
+        torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'chest_xray_model.pth'))
+        np.save(os.path.join(MODEL_DIR, 'class_names.npy'), class_names)
         
         return model
     except Exception as e:
         print(f"Error in train_model: {str(e)}")
         raise
-
 if __name__ == "__main__":
     try:
         model = train_model()
